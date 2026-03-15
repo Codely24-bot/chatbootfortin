@@ -760,8 +760,24 @@ const horarioFuncionamento = '';
 const enderecoLoja = '';
 const TEMPO_PAUSA_ATENDENTE_MS = 10 * 60 * 1000;
 
+const TIMEZONE_PADRAO = process.env.TZ || "America/Sao_Paulo";
+
+const obterHoraLocal = () => {
+  try {
+    const partes = new Intl.DateTimeFormat("pt-BR", {
+      hour: "2-digit",
+      hour12: false,
+      timeZone: TIMEZONE_PADRAO,
+    }).formatToParts(new Date());
+    const hora = partes.find((parte) => parte.type === "hour")?.value;
+    return Number(hora);
+  } catch (erro) {
+    return new Date().getHours();
+  }
+};
+
 const obterSaudacao = () => {
-  const hora = new Date().getHours();
+  const hora = obterHoraLocal();
 
   if (hora >= 0 && hora <= 11) return "Bom dia";
   if (hora >= 12 && hora <= 17) return "Boa tarde";
