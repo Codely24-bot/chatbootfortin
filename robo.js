@@ -13,6 +13,22 @@ let qrDataUrl = null;
 let qrPngBuffer = null;
 let qrAtualizadoEm = null;
 let botConectado = false;
+let ultimoErroQr = null;
+let ultimoErroAuth = null;
+let reinicioEmAndamento = false;
+let inicializandoCliente = false;
+
+const runtimeDataPath = path.resolve(
+  process.env.RAILWAY_VOLUME_MOUNT_PATH || process.env.APP_DATA_DIR || __dirname
+);
+const authDataPath = path.join(runtimeDataPath, ".wwebjs_auth");
+const cacheDataPath = path.join(runtimeDataPath, ".wwebjs_cache");
+const AUTO_LIMPAR_SESSAO = process.env.WPP_AUTO_CLEAR_SESSION !== "0";
+const AUTO_REINICIAR_EM_FALHA = process.env.WPP_AUTO_RESTART_ON_FAIL !== "0";
+
+if (!fs.existsSync(runtimeDataPath)) {
+  fs.mkdirSync(runtimeDataPath, { recursive: true });
+}
 
 const escapeHtml = (valor = "") =>
   valor
@@ -29,8 +45,8 @@ const normalizarChave = (texto = "") =>
     .toLowerCase()
     .trim();
 
-const bairrosFilePath = path.join(__dirname, "bairros.json");
-const configFilePath = path.join(__dirname, "config.json");
+const bairrosFilePath = path.join(runtimeDataPath, "bairros.json");
+const configFilePath = path.join(runtimeDataPath, "config.json");
 const bairrosData = {
   list: [],
   map: {},
@@ -131,7 +147,9 @@ const salvarConfig = (payload) => {
 // CLIENTE WHATSAPP
 // =====================================
 const client = new Client({
-    authStrategy: new LocalAuth(),
+    authStrategy: new LocalAuth({
+        dataPath: authDataPath
+    }),
     puppeteer: {
         headless: true,
         args: [
@@ -164,10 +182,15 @@ client.on("authenticated", () => {
 
 client.on("auth_failure", (msg) => {
   botConectado = false;
+  ultimoErroAuth = String(msg || "Falha de autenticacao");
   ultimoQr = null;
   qrDataUrl = null;
   qrPngBuffer = null;
   console.log("❌ Falha de autenticação:", msg);
+
+  if (AUTO_REINICIAR_EM_FALHA) {
+    reiniciarCliente(ultimoErroAuth, { limparSessao: AUTO_LIMPAR_SESSAO });
+  }
 });
 
 // =====================================
@@ -184,6 +207,7 @@ const atualizarQrImagem = async (qr) => {
   botConectado = false;
   ultimoQr = qr;
   qrAtualizadoEm = new Date().toISOString();
+  ultimoErroAuth = null;
 
   try {
     const opcoesQr = {
@@ -196,12 +220,67 @@ const atualizarQrImagem = async (qr) => {
 
     qrDataUrl = await QRCode.toDataURL(qr, opcoesQr);
     qrPngBuffer = await QRCode.toBuffer(qr, opcoesQr);
+    ultimoErroQr = null;
     console.log("QR Code atualizado. Abra a rota /qr no Railway para escanear.");
   } catch (erro) {
     qrDataUrl = null;
     qrPngBuffer = null;
+    ultimoErroQr = erro?.message || String(erro);
     console.log("Erro ao gerar imagem do QR:", erro);
   }
+};
+
+const limparSessaoLocal = () => {
+  try {
+    if (fs.existsSync(authDataPath)) {
+      fs.rmSync(authDataPath, { recursive: true, force: true });
+    }
+    if (fs.existsSync(cacheDataPath)) {
+      fs.rmSync(cacheDataPath, { recursive: true, force: true });
+    }
+    console.log("Sessao local removida (.wwebjs_auth/.wwebjs_cache).");
+  } catch (erro) {
+    console.log("Erro ao limpar sessao local:", erro);
+  }
+};
+
+const iniciarCliente = async () => {
+  if (inicializandoCliente) return;
+  inicializandoCliente = true;
+  try {
+    await Promise.resolve(client.initialize());
+  } finally {
+    inicializandoCliente = false;
+  }
+};
+
+const reiniciarCliente = async (motivo, { limparSessao = false } = {}) => {
+  if (reinicioEmAndamento) return;
+  reinicioEmAndamento = true;
+
+  if (motivo) {
+    console.log("Reiniciando WhatsApp:", motivo);
+  } else {
+    console.log("Reiniciando WhatsApp.");
+  }
+
+  try {
+    await Promise.resolve(client.destroy());
+  } catch (erro) {
+    console.log("Aviso ao destruir cliente:", erro?.message || erro);
+  }
+
+  if (limparSessao) {
+    limparSessaoLocal();
+  }
+
+  setTimeout(async () => {
+    try {
+      await iniciarCliente();
+    } finally {
+      reinicioEmAndamento = false;
+    }
+  }, 2000);
 };
 
 client.on("qr", atualizarQrImagem);
@@ -212,6 +291,8 @@ client.on("ready", () => {
   qrDataUrl = null;
   qrPngBuffer = null;
   qrAtualizadoEm = new Date().toISOString();
+  ultimoErroAuth = null;
+  ultimoErroQr = null;
 });
 
 client.on("disconnected", () => {
@@ -222,6 +303,8 @@ client.on("disconnected", () => {
 });
 
 const porta = Number(process.env.PORT) || 3001;
+const host = process.env.HOST || "0.0.0.0";
+const portaFixaDoAmbiente = Boolean(process.env.PORT);
 
 const headersSemCache = {
   "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
@@ -381,6 +464,9 @@ const servidor = http.createServer((req, res) => {
   }
 
   if (requestPath === "/qr") {
+    const qrSrc = qrDataUrl
+      ? qrDataUrl
+      : `/qr.png?t=${encodeURIComponent(qrAtualizadoEm || "")}`;
     const pagina = qrDataUrl
       ? `<!DOCTYPE html>
 <html lang="pt-BR">
@@ -458,7 +544,7 @@ const servidor = http.createServer((req, res) => {
     <main>
       <h1>Escaneie o QR Code</h1>
       <p>Abra esta pagina no celular ou no computador. Ela recarrega sozinha e usa uma imagem PNG sem cache para facilitar a leitura.</p>
-      <img src="/qr.png?t=${encodeURIComponent(qrAtualizadoEm || "")}" alt="QR Code do WhatsApp" />
+      <img src="${qrSrc}" alt="QR Code do WhatsApp" />
       <div class="status">Atualizado em: ${escapeHtml(qrAtualizadoEm || "")}</div>
       <code>/qr.png</code>
     </main>
@@ -553,6 +639,11 @@ const servidor = http.createServer((req, res) => {
     <main>
       <h1>Aguardando QR Code</h1>
       <p>Assim que o WhatsApp gerar um novo QR, esta pagina vai exibir a imagem automaticamente.</p>
+      ${
+        ultimoErroAuth || ultimoErroQr
+          ? `<p><strong>Detalhe:</strong> ${escapeHtml(ultimoErroAuth || ultimoErroQr)}</p>`
+          : ""
+      }
     </main>
   </body>
 </html>`;
@@ -563,6 +654,23 @@ const servidor = http.createServer((req, res) => {
       "Content-Type": "text/html; charset=utf-8",
     });
     res.end(pagina);
+    return;
+  }
+
+  if (requestPath === "/health" || requestPath === "/healthz") {
+    res.writeHead(200, {
+      ...headersSemCache,
+      ...corsHeaders,
+      "Content-Type": "application/json; charset=utf-8",
+    });
+    res.end(
+      JSON.stringify({
+        status: "ok",
+        whatsapp: botConectado ? "conectado" : ultimoQr ? "qr_disponivel" : "aguardando_qr",
+        updatedAt: qrAtualizadoEm,
+        runtimeDataPath,
+      })
+    );
     return;
   }
 
@@ -579,13 +687,21 @@ const servidor = http.createServer((req, res) => {
 const iniciarServidor = (portaInicial) => {
   let portaAtual = portaInicial;
   const tentar = () => {
-    servidor.listen(portaAtual, () => {
-      console.log(`Painel do QR ativo na porta ${portaAtual}. Use /qr para abrir a imagem.`);
+    servidor.listen(portaAtual, host, () => {
+      console.log(
+        `Painel do QR ativo em ${host}:${portaAtual}. Use /qr para abrir a imagem.`
+      );
+      console.log(`Dados persistidos em: ${runtimeDataPath}`);
     });
   };
 
   servidor.on("error", (erro) => {
     if (erro.code === "EADDRINUSE") {
+      if (portaFixaDoAmbiente) {
+        console.log(`Porta ${portaAtual} ocupada e o ambiente exige esse PORT. Encerrando processo.`);
+        process.exit(1);
+      }
+
       const antiga = portaAtual;
       portaAtual += 1;
       console.log(`⚠️ Porta ${antiga} em uso. Tentando porta ${portaAtual}...`);
@@ -601,7 +717,7 @@ const iniciarServidor = (portaInicial) => {
 
 iniciarServidor(porta);
 
-client.initialize();
+iniciarCliente();
 
 // =====================================
 // CONTROLES
